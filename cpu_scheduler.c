@@ -7,6 +7,9 @@
 #define MAX_IO 3
 #define MAX_TIME 1000
 #define TIME_QUANTUM 5
+#define MAX_TICKETS 10
+#define AGING_INTERVAL 5
+#define AGING_AMOUNT 1
 
 //process 구조체 정의
 typedef struct {
@@ -25,6 +28,7 @@ typedef struct {
 
     int priority;
     int readyq_time; // ready queue에 들어온 시점
+    int last_aged_time; // 마지막으로 우선 순위가 갱신된 시점
 
     int start_time;
     int completion_time;
@@ -32,6 +36,8 @@ typedef struct {
     int waiting_time;
     int response_time;
     int is_completed;
+
+    int ticket_count; // lottery scheduling 필드
 } Process;
 
 //queue 구조체 정의
@@ -42,7 +48,7 @@ typedef struct {
     int size;
 } Queue;
 
-//Min heap 구조체 정의의
+//Min heap 구조체 정의
 typedef struct {
     Process* data[MAX_PROCESS];
     int size;
@@ -252,6 +258,62 @@ Process* heapPop_priority(MinHeap *h){
     return min;
 }
 
+void rebuild_priority_heap(MinHeap *h){
+    MinHeap temp = *h;
+    initMinHeap(h);
+    for (int i=0; i<temp.size; i++){
+        if (heapInsert_priority(h, temp.data[i]) < 0){
+            printf("ready heap overflow");
+            return;
+        }
+    }
+    return;
+}
+
+int remove_from_queue(Queue *q, Process *p){
+    int idx = -1;
+    for (int i = 0; i<q->size; i++){
+        int pos = (q->front + i) % MAX_PROCESS;
+        if (q->data[pos] == p){
+            idx = pos;
+            break;
+        }
+    }
+    if (idx < 0) return -1; //실패
+    while (idx != q->rear){
+        int next = (idx + 1) % MAX_PROCESS;
+        q->data[idx] = q->data[next];
+        idx = next; 
+    }
+    q->rear = (q->rear - 1 + MAX_PROCESS) % MAX_PROCESS;
+    q->size--;
+    return 0;
+}
+
+Process* select_by_lottery(Queue *ready_queue){
+    int total = 0;
+    for (int i=0; i < ready_queue->size; i++){
+        Process *p = ready_queue->data[(ready_queue->front + i) % MAX_PROCESS];
+        total += p->ticket_count;
+    }
+    if (total == 0) return NULL;
+    int win = rand() % total + 1;
+    int sum = 0;
+    for (int i=0; i < ready_queue->size; i++){
+        Process *p = ready_queue->data[(ready_queue->front + i) % MAX_PROCESS];
+        sum += p->ticket_count;
+        if (sum >= win){
+            if (remove_from_queue(ready_queue, p) < 0){
+                return NULL;
+            }
+            return p;
+        }
+        
+    }
+    return NULL;
+
+}
+
 //Gantt 차트
 int gantt_chart[MAX_TIME];
 int gantt_length = 0;
@@ -285,7 +347,7 @@ void Print_GanttChart(char algorithm[]){
     printf("---------------------------------------------\n");
 
     printf("0");
-    for (int i = 1; i <= gantt_length; i++) printf("   %2d", i);
+    for (int i = 1; i <= gantt_length; i++) printf("  %3d", i);
     printf("\n\n");
 }
 
@@ -343,9 +405,12 @@ void Create_Process(int n){
 
         processes[i].priority = rand() % 10;
         processes[i].readyq_time = processes[i].arrival_time;
+        processes[i].last_aged_time = processes[i].arrival_time;
 
         processes[i].is_completed = 0;
         processes[i].start_time = -1;
+
+        processes[i].ticket_count = 1 + rand() % MAX_TICKETS;
     }
 }
 
@@ -353,7 +418,7 @@ void Input_Process(int n){
     process_count = n;
     for (int i = 0; i < n; i++){
         processes[i].pid = i + 1;
-        printf("P%d의 Arrival CPU Priority를 입력하시오.(예시:11 14 2)", processes[i].pid);
+        printf("P%d: Enter Arrival, CPU, Priority (ex:11 14 2)", processes[i].pid);
         scanf("%d %d %d",
               &processes[i].arrival_time,
               &processes[i].total_cpu_burst_time,
@@ -384,8 +449,11 @@ void Input_Process(int n){
             ? processes[i].io_request_times[0]
             : processes[i].total_cpu_burst_time;
         processes[i].readyq_time = processes[i].arrival_time;
+        processes[i].last_aged_time = processes[i].arrival_time;
         processes[i].is_completed = 0;
         processes[i].start_time = -1;
+
+        processes[i].ticket_count = 1 + rand() % MAX_TICKETS;
     }
 }
 
@@ -417,7 +485,7 @@ void ConfigMinHeap(){
 }
 
 
-// 스케줄링 알고리즘들
+// 스케줄링 알고리즘
 
 void FCFS(){
     ConfigQueue();
@@ -1059,6 +1127,216 @@ void round_robin(){
     Print_Evaluation(arr_waiting_time, arr_turnaround_time, num_completed_process);
 }
 
+void lottery_scheduling(){
+    ConfigQueue();
+    int current_time = 0;
+    int num_completed_process = 0;
+    int arr_waiting_time[MAX_PROCESS] = {0};
+    int arr_turnaround_time[MAX_PROCESS] = {0};
+
+    Process *current = NULL; // cpu에서 현재 실행 중인 process
+
+    while (num_completed_process < process_count){
+
+        //io 실행
+        int wq_size = waiting_queue.size;
+        for (int i=0; i<wq_size; i++){
+            Process *p = dequeue(&waiting_queue);
+            p->io_burst_times[p->io_index] --;
+            if (p->io_burst_times[p->io_index] == 0){
+                p->io_index ++;
+                if (enqueue(&ready_next_queue, p) < 0){
+                    printf("ready next queue overflow");
+                    return;
+                }
+            } else{
+                if (enqueue(&waiting_queue, p) < 0){
+                    printf("waiting queue overflow");
+                    return;
+                }
+            }
+        }
+
+        // 도착하면 ready queue에 추가
+        for (int i=0; i<process_count; i++){
+            if (!processes[i].is_completed && processes[i].arrival_time == current_time){
+                if (enqueue(&ready_queue, &processes[i]) < 0){
+                    printf("ready queue overflow");
+                    return;
+                }
+            }
+        }
+
+        // process가 비었다면 process를 할당
+        if (current == NULL){
+            current = select_by_lottery(&ready_queue);
+            if (current && current->start_time == -1){
+                current->start_time = current_time;
+            }
+        }
+
+        // process 실행
+        if (current){
+            current->remaining_time--;
+            Record_Gantt(current->pid);
+
+            // io 작업 발생
+            int executed = current->total_cpu_burst_time - current->remaining_time;
+            if (current->remaining_time > 0 
+                && current->io_index < current->io_count 
+                && executed == current->io_request_times[current->io_index]){
+                if (enqueue(&waiting_queue, current) < 0){
+                    printf("waiting queue overflow");
+                    return;
+                }
+                current = NULL;
+            }
+
+            // process 종료
+            if (current != NULL && current->remaining_time == 0){
+                current->completion_time = current_time + 1;
+                current->turnaround_time = current->completion_time - current->arrival_time;
+                current->waiting_time = current->turnaround_time - current->total_cpu_burst_time - current->total_io_time;
+                current->response_time = current->start_time - current->arrival_time;
+                current->is_completed = 1;
+                num_completed_process ++;
+
+                arr_waiting_time[current->pid - 1] = current->waiting_time;
+                arr_turnaround_time[current->pid - 1] = current->turnaround_time;
+                current = NULL;
+            }
+        }
+        else{ //idle
+            Record_Gantt(0);
+        }
+        int rn_size = ready_next_queue.size;
+        for (int i = 0; i < rn_size; i++) {
+            Process *p = dequeue(&ready_next_queue);
+            if (enqueue(&ready_queue, p) < 0) {
+                printf("ready_queue overflow\n");
+                return;
+            }
+        }    
+        
+        current_time++;
+    }
+    Print_GanttChart("lottery scheduling");
+    Print_Evaluation(arr_waiting_time, arr_turnaround_time, num_completed_process);
+}
+
+void non_preemptive_priority_aging(){
+    ConfigMinHeap();
+    int current_time = 0;
+    int num_completed_process = 0;
+    int arr_waiting_time[MAX_PROCESS] = {0};
+    int arr_turnaround_time[MAX_PROCESS] = {0};
+
+    Process *current = NULL; // cpu에서 현재 실행 중인 process
+
+    while (num_completed_process < process_count){
+
+        //io 실행
+        int wq_size = waiting_queue.size;
+        for (int i=0; i<wq_size; i++){
+            Process *p = dequeue(&waiting_queue);
+            p->io_burst_times[p->io_index] --;
+            if (p->io_burst_times[p->io_index] == 0){ // io 종료
+                p->io_index ++;
+                p->readyq_time = current_time;
+
+                if (enqueue(&ready_next_queue, p) < 0){
+                    printf("ready next queue overflow");
+                    return;
+                }
+            } else{
+                if (enqueue(&waiting_queue, p) < 0){
+                    printf("waiting queue overflow");
+                    return;
+                }
+            }
+        }
+
+        // 도착하면 ready heap에 추가
+        for (int i=0; i<process_count; i++){
+            if (!processes[i].is_completed && processes[i].arrival_time == current_time){
+                processes[i].readyq_time = current_time;
+                processes[i].last_aged_time = current_time;
+                if (heapInsert_priority(&ready_heap, &processes[i]) < 0){
+                    printf("ready heap overflow");
+                    return;
+                }
+            }
+        }
+
+        for (int i=0; i < ready_heap.size; i++){ //aging
+            Process *p = ready_heap.data[i];
+            if (current_time - p->last_aged_time >= AGING_INTERVAL){
+                p->priority = (p->priority > AGING_AMOUNT) ? p->priority - AGING_AMOUNT : 0;
+                p->last_aged_time = current_time;
+            }
+        }
+        rebuild_priority_heap(&ready_heap); // ready heap 재배열
+
+        // process가 비었다면 process를 할당
+        if (current == NULL){
+            current = heapPop_priority(&ready_heap);
+            if (current && current->start_time == -1){
+                current->start_time = current_time;
+            }
+            if (current){
+                current->last_aged_time = current_time;
+            }            
+        }
+
+        // process 실행
+        if (current){
+            current->remaining_time--;
+            Record_Gantt(current->pid);
+
+            // io 작업 발생
+            int executed = current->total_cpu_burst_time - current->remaining_time;
+            if (current->remaining_time > 0 
+                && current->io_index < current->io_count 
+                && executed == current->io_request_times[current->io_index]){
+                if (enqueue(&waiting_queue, current) < 0){
+                    printf("waiting queue overflow");
+                    return;
+                }
+                current = NULL;
+            }
+
+            // process 종료
+            if (current != NULL && current->remaining_time == 0){
+                current->completion_time = current_time + 1;
+                current->turnaround_time = current->completion_time - current->arrival_time;
+                current->waiting_time = current->turnaround_time - current->total_cpu_burst_time - current->total_io_time;
+                current->response_time = current->start_time - current->arrival_time;
+                current->is_completed = 1;
+                num_completed_process ++;
+
+                arr_waiting_time[current->pid - 1] = current->waiting_time;
+                arr_turnaround_time[current->pid - 1] = current->turnaround_time;
+                current = NULL;
+            }
+        }
+        else{ //idle
+            Record_Gantt(0);
+        }
+        int rn_size = ready_next_queue.size;
+        for (int i = 0; i < rn_size; i++) {
+            Process *p = dequeue(&ready_next_queue);
+            if (heapInsert_priority(&ready_heap, p) < 0) {
+                printf("ready_heap overflow\n");
+                return;
+            }
+        }   
+        current_time++;
+
+    }
+    Print_GanttChart("non preemptive priority aging");
+    Print_Evaluation(arr_waiting_time, arr_turnaround_time, num_completed_process);
+}
+
 
 void Print_Processes() {
     printf("PID\tArrival\tCPU\tPriority\tio_request_1\tio_burst_1\tio_request_2\tio_burst_2\tio_request_3\tio_burst_3\n");
@@ -1084,15 +1362,15 @@ void Print_Processes() {
 
 int main() {
     int n;
-    printf("20 이하 프로세스 수 입력: ");
+    printf("Enter number of processes (<=20): ");
     scanf("%d", &n);
     if (n<1 || n > MAX_PROCESS){
-        printf(" 20 이하의 프로세스 수를 입력하시오.");
+        printf(" Enter number of processes (<=20): ");
         return -1;
     }
 
     int mode;
-    printf("모드 선택: 1: 랜덤 생성 2: 사용자 입력\n");
+    printf("mode selection: 1: random 2: user input\n");
     scanf("%d", &mode);
 
     if (mode == 1) {
@@ -1101,9 +1379,9 @@ int main() {
         Create_Process(n);
 
     } else if (mode ==2){
-        Input_Process(n);
+        Input_Process(n); // process 설정을 입력함.
     } else{
-        printf("1 또는 2를 입력하시오.");
+        printf("enter 1 or 2");
         return -1;
     }
 
@@ -1127,5 +1405,12 @@ int main() {
 
     ResetProcess();
     round_robin(); // time quantum=5
+
+    ResetProcess();
+    lottery_scheduling();
+
+    ResetProcess();
+    non_preemptive_priority_aging();
+
     return 0;
 }
