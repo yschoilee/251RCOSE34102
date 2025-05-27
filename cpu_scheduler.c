@@ -38,6 +38,9 @@ typedef struct {
     int is_completed;
 
     int ticket_count; // lottery scheduling 필드
+
+    int deadline;
+    int missed; // 1이면 deadline을 넘겼다는 의미
 } Process;
 
 //queue 구조체 정의
@@ -141,6 +144,26 @@ int heapInsert_priority(MinHeap *h, Process *p){
         Process *pp = h->data[parent];
         if (pp->priority < p->priority 
             || (pp->priority == p->priority
+            && pp->readyq_time <= p->readyq_time)){
+            break;
+        }
+        h->data[i] = pp;
+        i = parent;
+    }
+    h->data[i] = p;
+    return 0; //성공
+}
+
+int heapInsert_EDF(MinHeap *h, Process *p){
+    if (h->size >= MAX_PROCESS){
+        return -1; // 실패
+    }
+    int i = h -> size++;
+    while (i > 0){
+        int parent = (i -1) / 2;
+        Process *pp = h->data[parent];
+        if (pp->deadline < p->deadline 
+            || (pp->deadline == p->deadline
             && pp->readyq_time <= p->readyq_time)){
             break;
         }
@@ -258,6 +281,43 @@ Process* heapPop_priority(MinHeap *h){
     return min;
 }
 
+Process* heapPop_EDF(MinHeap *h){
+    if (h->size == 0) return NULL;
+    Process* min = h->data[0];
+    Process* last = h->data[--h->size];
+
+    int parent = 0;
+    while (1){
+        int left = 2 * parent + 1;
+        int right = 2 * parent + 2;
+        int child;
+
+        if (left >= h->size) break;
+
+        child = left;
+        if (right < h->size){
+            if(h->data[right]->deadline < h->data[left]->deadline 
+                || (h->data[right]->deadline == h->data[left]->deadline 
+                && h->data[right]->readyq_time <= h->data[left]->readyq_time)){
+                child = right;
+            }
+        }
+            
+
+        if (h->data[child]->deadline > last->deadline 
+            || (last->deadline == h->data[child]->deadline 
+                && last->readyq_time <= h->data[child]->readyq_time)){
+            break;
+        }
+
+        h->data[parent] = h->data[child];
+        parent = child;
+    }
+    h->data[parent] = last;
+
+    return min;
+}
+
 void rebuild_priority_heap(MinHeap *h){
     MinHeap temp = *h;
     initMinHeap(h);
@@ -318,6 +378,15 @@ Process* select_by_lottery(Queue *ready_queue){
 int gantt_chart[MAX_TIME];
 int gantt_length = 0;
 
+//전역 변수
+Process processes[MAX_PROCESS];
+Process backup_processes[MAX_PROCESS];
+int process_count;
+Queue ready_queue; // 이번 틱의 후보
+Queue ready_next_queue; // 다음 틱의 후보
+Queue waiting_queue;
+MinHeap ready_heap;
+
 static inline void Record_Gantt(int pid){
     if (gantt_length < MAX_TIME)
         gantt_chart[gantt_length++] = pid;
@@ -351,26 +420,32 @@ void Print_GanttChart(char algorithm[]){
     printf("\n\n");
 }
 
-void Print_Evaluation(int arr_waiting_time[], int arr_turnaround_time[], int num_process){
+void Print_Evaluation(int arr_waiting_time[], int arr_turnaround_time[], int num_completed_process){
+    if (num_completed_process == 0){
+        printf("Average waiting time: %d\n", 0);
+        printf("Average turnaround time: %d\n", 0);
+        return;
+    }
     int turnaround = 0;
     int waiting = 0;
-    for (int i=0; i < num_process; i++){
-        waiting += arr_waiting_time[i];
-        turnaround += arr_turnaround_time[i];
+    for (int i=0; i < process_count; i++){
+        if (processes[i].is_completed && !processes[i].missed){
+            waiting += arr_waiting_time[i];
+            turnaround += arr_turnaround_time[i];
+        }        
     }
-    printf("Average waiting time: %.2f\n", (float)waiting / (float)num_process);
-    printf("Average turnaround time: %.2f\n", (float)turnaround / (float)num_process);
+    printf("Average waiting time: %.2f\n", (float)waiting / (float)num_completed_process);
+    printf("Average turnaround time: %.2f\n", (float)turnaround / (float)num_completed_process);
 }
 
-
-//전역 변수
-Process processes[MAX_PROCESS];
-Process backup_processes[MAX_PROCESS];
-int process_count;
-Queue ready_queue; // 이번 틱의 후보
-Queue ready_next_queue; // 다음 틱의 후보
-Queue waiting_queue;
-MinHeap ready_heap;
+void Print_Deadline(){
+    printf("\n<preemptive EDF deadline>\n");
+    printf("PID\tDeadline\n");
+    for (int i=0; i<process_count; i++){
+        printf("%3d\t%3d\n", processes[i].pid, processes[i].deadline);
+    }
+    printf("\n");
+}
 
 void Create_Process(int n){
     process_count = n;
@@ -411,6 +486,9 @@ void Create_Process(int n){
         processes[i].start_time = -1;
 
         processes[i].ticket_count = 1 + rand() % MAX_TICKETS;
+
+        processes[i].deadline = processes[i].arrival_time + (processes[i].total_cpu_burst_time + processes[i].total_io_time) * 1.5;
+        processes[i].missed = 0;
     }
 }
 
@@ -454,6 +532,9 @@ void Input_Process(int n){
         processes[i].start_time = -1;
 
         processes[i].ticket_count = 1 + rand() % MAX_TICKETS;
+
+        processes[i].deadline = processes[i].arrival_time + (processes[i].total_cpu_burst_time + processes[i].total_io_time) * 1.5;
+        processes[i].missed = 0;
     }
 }
 
@@ -1337,6 +1418,141 @@ void non_preemptive_priority_aging(){
     Print_Evaluation(arr_waiting_time, arr_turnaround_time, num_completed_process);
 }
 
+void preemptive_EDF(){
+    ConfigMinHeap();
+    int current_time = 0;
+    int num_completed_process = 0;
+    int missed_process = 0;
+    int arr_waiting_time[MAX_PROCESS] = {0};
+    int arr_turnaround_time[MAX_PROCESS] = {0};
+
+    Process *current = NULL; // cpu에서 현재 실행 중인 process
+    Print_Deadline();
+
+    while (num_completed_process + missed_process < process_count){
+
+        //io 실행
+        int wq_size = waiting_queue.size;
+        for (int i=0; i<wq_size; i++){
+            Process *p = dequeue(&waiting_queue);
+            p->io_burst_times[p->io_index] --;
+            if (p->io_burst_times[p->io_index] == 0){ // io 종료, ready heap으로 복귀귀
+                p->io_index ++;
+                p->readyq_time = current_time;
+
+                if (enqueue(&ready_next_queue, p) < 0){
+                    printf("ready next queue overflow");
+                    return;
+                }
+            } else{
+                if (enqueue(&waiting_queue, p) < 0){
+                    printf("waiting queue overflow");
+                    return;
+                }
+            }
+        }
+
+        // 도착하면 ready heap에 추가
+        for (int i=0; i<process_count; i++){
+            if (!processes[i].is_completed && processes[i].arrival_time == current_time){
+                processes[i].readyq_time = current_time;
+                if (heapInsert_EDF(&ready_heap, &processes[i]) < 0){
+                    printf("ready heap overflow");
+                    return;
+                }
+            }
+        }
+
+        // deadline을 넘긴 process는 종료시킴
+        while (ready_heap.size > 0 && ready_heap.data[0]->deadline < current_time){
+            Process *missed = heapPop_EDF(&ready_heap);
+            printf("P%d deadline(%d) missed at %d\n", missed->pid, missed->deadline, current_time);
+            missed->missed = 1;
+            missed->is_completed = 1;
+            missed_process ++;
+            arr_waiting_time[missed->pid - 1] = 0;
+            arr_turnaround_time[missed->pid - 1] = 0;
+        }
+        if (current && current->deadline < current_time){
+            printf("P%d deadline(%d) missed at %d\n", current->pid, current->deadline, current_time);
+            current->is_completed = 1;
+            arr_waiting_time[current->pid - 1] = 0;
+            arr_turnaround_time[current->pid - 1] = 0;
+            current = NULL;
+            missed_process ++;
+            
+        }
+
+
+        Process *top = (ready_heap.size > 0 ? ready_heap.data[0] : NULL);
+
+        // process가 비었다면 process를 할당
+        if (current == NULL){
+            current = heapPop_EDF(&ready_heap);
+            if (current && current->start_time == -1){
+                current->start_time = current_time;
+            }
+        }
+        else if (top && (top->deadline < current->deadline)){
+            current->readyq_time = current_time;
+            if (heapInsert_EDF(&ready_heap, current) < 0){
+                    printf("ready heap overflow");
+                    return;
+                }
+            current = heapPop_EDF(&ready_heap);
+            if (current->start_time == -1)
+                current->start_time = current_time;
+        }
+
+        // process 실행
+        if (current){
+            current->remaining_time--;
+            Record_Gantt(current->pid);
+
+            // io 작업 발생
+            int executed = current->total_cpu_burst_time - current->remaining_time;
+            if (current->remaining_time > 0 
+                && current->io_index < current->io_count 
+                && executed == current->io_request_times[current->io_index]){
+                if (enqueue(&waiting_queue, current) < 0){
+                    printf("waiting queue overflow");
+                    return;
+                }
+                current = NULL;
+            }
+
+            // process 종료
+            if (current != NULL && current->remaining_time == 0){
+                current->completion_time = current_time + 1;
+                current->turnaround_time = current->completion_time - current->arrival_time;
+                current->waiting_time = current->turnaround_time - current->total_cpu_burst_time - current->total_io_time;
+                current->response_time = current->start_time - current->arrival_time;
+                current->is_completed = 1;
+                num_completed_process ++;
+
+                arr_waiting_time[current->pid - 1] = current->waiting_time;
+                arr_turnaround_time[current->pid - 1] = current->turnaround_time;
+                current = NULL;
+            }
+        }
+        else{ //idle
+            Record_Gantt(0);
+        }
+        int rn_size = ready_next_queue.size;
+        for (int i = 0; i < rn_size; i++) {
+            Process *p = dequeue(&ready_next_queue);
+            if (heapInsert_EDF(&ready_heap, p) < 0) {
+                printf("ready_heap overflow\n");
+                return;
+            }
+        }   
+        current_time++;
+
+    }
+    
+    Print_GanttChart("preemptive EDF");
+    Print_Evaluation(arr_waiting_time, arr_turnaround_time, num_completed_process);
+}
 
 void Print_Processes() {
     printf("PID\tArrival\tCPU\tPriority\tio_request_1\tio_burst_1\tio_request_2\tio_burst_2\tio_request_3\tio_burst_3\n");
@@ -1360,6 +1576,7 @@ void Print_Processes() {
 }
 
 
+
 int main() {
     int n;
     printf("Enter number of processes (<=20): ");
@@ -1370,18 +1587,18 @@ int main() {
     }
 
     int mode;
-    printf("mode selection: 1: random 2: user input\n");
+    printf("Enter mode selection: 1: random 2: user input\n");
     scanf("%d", &mode);
 
     if (mode == 1) {
-        srand(43);
-        //srand(time(NULL));
+        //srand(43);
+        srand(time(NULL));
         Create_Process(n);
 
     } else if (mode ==2){
         Input_Process(n); // process 설정을 입력함.
     } else{
-        printf("enter 1 or 2");
+        printf("Enter 1 or 2");
         return -1;
     }
 
@@ -1411,6 +1628,9 @@ int main() {
 
     ResetProcess();
     non_preemptive_priority_aging();
+
+    ResetProcess();
+    preemptive_EDF();
 
     return 0;
 }
