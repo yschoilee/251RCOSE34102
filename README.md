@@ -1,5 +1,5 @@
 
-````markdown
+
 # CPU Scheduler Simulator (`cpu_scheduler.c`)
 
 이 프로그램은 단일 CPU 환경에서 여러 스케줄링 알고리즘을 틱 단위 시뮬레이션하며,  
@@ -208,40 +208,9 @@ I/O 관련 정보(`io_count`, `io_request_times`, `io_burst_times`)는 동일한
 * 가장 이른 deadline을 가진 프로세스 우선
 * 다음 두 경우에 deadline miss 처리함:
 
-### 1) **Ready Heap에 있는 프로세스가 deadline을 초과한 경우**
+ 1) *Ready Heap에 있는 프로세스가 deadline을 초과한 경우*
 
-```c
-missed->missed = 1;
-missed->is_completed = 1;
-arr_waiting_time[...] = 0;
-arr_turnaround_time[...] = 0;
-```
-
-### 2) **CPU에서 실행 중이던 프로세스가 deadline을 초과한 경우**
-
-```c
-current->is_completed = 1;
-arr_waiting_time[...] = 0;
-arr_turnaround_time[...] = 0;
-```
-
-‼ **이 경우 코드상 `missed = 1`을 설정하지 않습니다.**
-
-→ 따라서 이 프로세스는 `missed == 0`이지만 waiting/turnaround가 모두 0으로 기록됩니다.
-
-### Evaluation 계산 방식 (코드 그대로)
-
-```c
-if (process.is_completed && !process.missed)
-    평균 계산에 포함됨
-```
-
-즉:
-
-* Ready Heap에서 miss된 프로세스 → 제외
-* CPU에서 miss된 프로세스 → 포함되지만 waiting/turnaround=0
-
-이는 코드의 실제 동작이며, README도 이대로 기술합니다.
+ 2) *CPU에서 실행 중이던 프로세스가 deadline을 초과한 경우*
 
 ---
 
